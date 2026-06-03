@@ -5,10 +5,10 @@ from icalendar import Calendar
 from datetime import date, datetime, timedelta
 
 # --- Configuration ---
-TENANT_ID = os.environ["TENANT_ID"]
-CLIENT_ID = os.environ["CLIENT_ID"]
-CLIENT_SECRET = os.environ["CLIENT_SECRET"]
-GROUP_ID = os.environ["GROUP_ID"]
+TENANT_ID = os.environ["TENANT_ID"].strip().strip('"').strip("'")
+CLIENT_ID = os.environ["CLIENT_ID"].strip().strip('"').strip("'")
+CLIENT_SECRET = os.environ["CLIENT_SECRET"].strip().strip('"').strip("'")
+GROUP_ID = os.environ["GROUP_ID"].strip().strip('"').strip("'")
 
 print(f"Debug - Client ID length: {len(CLIENT_ID)}")
 print(f"Debug - Tenant ID length: {len(TENANT_ID)}")
