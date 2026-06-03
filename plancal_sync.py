@@ -10,14 +10,17 @@ CLIENT_ID = os.environ["CLIENT_ID"].strip().replace('"', '').replace("'", "").re
 CLIENT_SECRET = os.environ["CLIENT_SECRET"].strip().replace('"', '').replace("'", "").replace('\\n', '').replace('\\r', '')
 TARGET_MAILBOX = os.environ["TARGET_MAILBOX"].strip().replace('"', '').replace("'", "").replace('\\n', '').replace('\\r', '')
 
+# Map feeds to their respective prefixes and Outlook Categories
 PCO_FEEDS = [
     {
         "url": "https://calendar.planningcenteronline.com/icals/eJxj4ajmsGLLz2TO62Sy4kotzi8oqWa34khOzPFU4jY0MzI3M2OzYnMNsWIrzWQ2r4624i5ILErMLa5mAAClxQ8Kc13fbb9a4c94004a94cf9db15e7aa867aa2dcb22",
-        "prefix": "⛪ "
+        "prefix": "⛪ ",
+        "category": "Church Events"
     },
     {
         "url": "https://calendar.planningcenteronline.com/icals/eJxj4ajmsGLLz2TO62Sy4kotzi8oqWa34khOzPFU4rQ0NTNhs2JzDbFiK81kNq-OtuIuSCxKzC2uZgAAi3cOpA==de88363ec427d412c80a30dd9f2185b68e050305",
-        "prefix": "🏢 "
+        "prefix": "🏢 ",
+        "category": "Office Events"
     }
 ]
 
@@ -43,10 +46,10 @@ def format_graph_datetime(dt_obj):
     elif isinstance(dt_obj, date):
         return {"dateTime": dt_obj.strftime("%Y-%m-%dT00:00:00"), "timeZone": "UTC"}
 
-def get_existing_events(headers):
-    """Fetches ALL events to map UIDs and build a Title+Time fingerprint to catch clones."""
-    # Removed time filters to guarantee total visibility
-    url = f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/events?$expand=extensions($filter=id eq '{EXTENSION_NAME}')&$top=1000"
+def get_existing_events(headers, cutoff_date_str):
+    """Fetches events within the sync window to build a fingerprint map and catch clones."""
+    # Restored the time filter to protect historical data from being purged
+    url = f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/events?$expand=extensions($filter=id eq '{EXTENSION_NAME}')&$filter=start/dateTime ge '{cutoff_date_str}Z'&$top=1000"
     
     graph_events = {}
     all_fingerprints = {}
@@ -66,7 +69,6 @@ def get_existing_events(headers):
             start_str = event.get("start", {}).get("dateTime", "")[:19]
             end_str = event.get("end", {}).get("dateTime", "")[:19]
             
-            # Build the anti-duplication fingerprint
             fp = f"{subject}_{start_str}"
             all_fingerprints[fp] = event["id"]
             
@@ -75,7 +77,8 @@ def get_existing_events(headers):
                     "id": event["id"],
                     "subject": subject,
                     "start": start_str,
-                    "end": end_str
+                    "end": end_str,
+                    "categories": event.get("categories", [])
                 }
         url = data.get("@odata.nextLink")
     return graph_events, all_fingerprints
@@ -87,18 +90,18 @@ def sync_calendars():
         "Content-Type": "application/json"
     }
     
-    print(f"Mapping existing calendar states for {TARGET_MAILBOX}...")
-    graph_events, all_fingerprints = get_existing_events(headers)
-    
-    # Ignore PCO feed events older than 60 days
+    # Establish the exact 60-day lookback window for BOTH Graph and PCO comparison
     cutoff_date = datetime.now(timezone.utc) - timedelta(days=60)
     cutoff_date_str = cutoff_date.strftime("%Y-%m-%dT00:00:00")
+    
+    print(f"Mapping existing calendar states for {TARGET_MAILBOX} (Looking back 60 days)...")
+    graph_events, all_fingerprints = get_existing_events(headers, cutoff_date_str)
     
     pco_current_uids = set()
     endpoint = f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/events"
 
     for feed in PCO_FEEDS:
-        print(f"Processing remote feed: {feed['url']}")
+        print(f"Processing remote feed: {feed['url']} (Category: {feed['category']})")
         try:
             res = requests.get(feed['url'])
             res.raise_for_status()
@@ -114,6 +117,7 @@ def sync_calendars():
             start_graph = format_graph_datetime(component.get('dtstart').dt)
             end_graph = format_graph_datetime(component.get('dtend').dt)
             
+            # The filter that ensures we don't process ancient PCO events
             if start_graph["dateTime"] < cutoff_date_str:
                 continue 
 
@@ -123,29 +127,32 @@ def sync_calendars():
             raw_summary = str(component.get('summary', 'Untitled Event'))
             summary = f"{feed['prefix']}{raw_summary}"
             description = str(component.get('description', ''))
+            target_category = feed['category']
             
             event_payload = {
                 "subject": summary,
                 "body": {"contentType": "Text", "content": description},
                 "start": start_graph,
                 "end": end_graph,
+                "categories": [target_category]
             }
 
             fingerprint = f"{summary}_{start_graph['dateTime']}"
 
             if pco_uid in graph_events:
                 existing = graph_events[pco_uid]
+                # Check if times changed, OR if the category hasn't been applied yet
                 if (existing["subject"] != summary or 
                     existing["start"] != start_graph["dateTime"] or 
-                    existing["end"] != end_graph["dateTime"]):
+                    existing["end"] != end_graph["dateTime"] or
+                    target_category not in existing.get("categories", [])):
                     
-                    print(f"Updating shifted event: {summary}")
+                    print(f"Updating shifted or un-categorized event: {summary}")
                     patch_url = f"{endpoint}/{existing['id']}"
                     res_patch = requests.patch(patch_url, headers=headers, json=event_payload)
                     if res_patch.status_code not in [200, 204]:
                         print(f"  -> Failed to update: {res_patch.text}")
             else:
-                # UID not found. Check the fingerprint to ensure we aren't creating a clone.
                 if fingerprint in all_fingerprints:
                     print(f"Re-linking existing event (UID shifted or tag missing): {summary}")
                     existing_id = all_fingerprints[fingerprint]
@@ -160,7 +167,6 @@ def sync_calendars():
                     ]
                     requests.patch(patch_url, headers=headers, json=event_payload)
                     
-                    # Protect this re-linked ID from being purged
                     stale_uids = [k for k, v in graph_events.items() if v["id"] == existing_id]
                     for k in stale_uids:
                         del graph_events[k]
