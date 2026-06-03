@@ -3,12 +3,17 @@ import requests
 import msal
 from icalendar import Calendar
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 # --- Configuration ---
 TENANT_ID = os.environ["TENANT_ID"].strip().replace('"', '').replace("'", "").replace('\\n', '').replace('\\r', '')
 CLIENT_ID = os.environ["CLIENT_ID"].strip().replace('"', '').replace("'", "").replace('\\n', '').replace('\\r', '')
 CLIENT_SECRET = os.environ["CLIENT_SECRET"].strip().replace('"', '').replace("'", "").replace('\\n', '').replace('\\r', '')
 TARGET_MAILBOX = os.environ["TARGET_MAILBOX"].strip().replace('"', '').replace("'", "").replace('\\n', '').replace('\\r', '')
+
+# Timezone Configuration (Arizona does not observe DST)
+LOCAL_TZ = ZoneInfo("America/Phoenix")
+GRAPH_TZ_STRING = "America/Phoenix"
 
 # Map feeds to their respective prefixes and Outlook Categories
 PCO_FEEDS = [
@@ -38,18 +43,23 @@ def get_graph_token():
     raise Exception(f"Failed to acquire token: {result.get('error_description')}")
 
 def format_graph_datetime(dt_obj):
-    """Normalizes icalendar date/datetime components strictly to UTC Graph strings."""
+    """Converts icalendar date/datetime components strictly to America/Phoenix time."""
     if isinstance(dt_obj, datetime):
-        if dt_obj.tzinfo is not None:
-            dt_obj = dt_obj.astimezone(timezone.utc)
-        return {"dateTime": dt_obj.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": "UTC"}
+        # If PCO sends a naive datetime, assume UTC to be safe before converting
+        if dt_obj.tzinfo is None:
+            dt_obj = dt_obj.replace(tzinfo=timezone.utc)
+        
+        # Convert mathematically to Arizona time
+        local_dt = dt_obj.astimezone(LOCAL_TZ)
+        return {"dateTime": local_dt.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": GRAPH_TZ_STRING}
     elif isinstance(dt_obj, date):
-        return {"dateTime": dt_obj.strftime("%Y-%m-%dT00:00:00"), "timeZone": "UTC"}
+        # All-day events get pinned to midnight Arizona time
+        return {"dateTime": dt_obj.strftime("%Y-%m-%dT00:00:00"), "timeZone": GRAPH_TZ_STRING}
 
-def get_existing_events(headers, cutoff_date_str):
-    """Fetches events within the sync window to build a fingerprint map and catch clones."""
-    # Restored the time filter to protect historical data from being purged
-    url = f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/events?$expand=extensions($filter=id eq '{EXTENSION_NAME}')&$filter=start/dateTime ge '{cutoff_date_str}Z'&$top=1000"
+def get_existing_events(headers, cutoff_date_utc_str):
+    """Fetches events within the sync window using the Arizona timezone header."""
+    # The Graph API filter requires UTC, so we pass the UTC string here
+    url = f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/events?$expand=extensions($filter=id eq '{EXTENSION_NAME}')&$filter=start/dateTime ge '{cutoff_date_utc_str}'&$top=1000"
     
     graph_events = {}
     all_fingerprints = {}
@@ -66,6 +76,8 @@ def get_existing_events(headers, cutoff_date_str):
             pco_uid = next((ext.get("pcoUid") for ext in extensions if ext.get("id") == EXTENSION_NAME), None)
             
             subject = event.get("subject", "Untitled Event")
+            
+            # Because of our headers, Graph returns these strings already converted to Arizona time
             start_str = event.get("start", {}).get("dateTime", "")[:19]
             end_str = event.get("end", {}).get("dateTime", "")[:19]
             
@@ -85,17 +97,24 @@ def get_existing_events(headers, cutoff_date_str):
 
 def sync_calendars():
     token = get_graph_token()
+    
+    # We instruct Microsoft Graph to speak to us strictly in Arizona Time
     headers = {
         "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "Prefer": f'outlook.timezone="{GRAPH_TZ_STRING}"'
     }
     
-    # Establish the exact 60-day lookback window for BOTH Graph and PCO comparison
-    cutoff_date = datetime.now(timezone.utc) - timedelta(days=60)
-    cutoff_date_str = cutoff_date.strftime("%Y-%m-%dT00:00:00")
+    # Graph API backend filtering requires a pure UTC timestamp
+    cutoff_date_utc = datetime.now(timezone.utc) - timedelta(days=60)
+    cutoff_date_utc_str = cutoff_date_utc.strftime("%Y-%m-%dT00:00:00Z")
     
-    print(f"Mapping existing calendar states for {TARGET_MAILBOX} (Looking back 60 days)...")
-    graph_events, all_fingerprints = get_existing_events(headers, cutoff_date_str)
+    # Our internal python comparison needs an Arizona timestamp to match the PCO feed
+    cutoff_date_local = datetime.now(LOCAL_TZ) - timedelta(days=60)
+    cutoff_date_local_str = cutoff_date_local.strftime("%Y-%m-%dT00:00:00")
+    
+    print(f"Mapping existing calendar states for {TARGET_MAILBOX} (Looking back 60 days in {GRAPH_TZ_STRING})...")
+    graph_events, all_fingerprints = get_existing_events(headers, cutoff_date_utc_str)
     
     pco_current_uids = set()
     endpoint = f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/events"
@@ -117,8 +136,8 @@ def sync_calendars():
             start_graph = format_graph_datetime(component.get('dtstart').dt)
             end_graph = format_graph_datetime(component.get('dtend').dt)
             
-            # The filter that ensures we don't process ancient PCO events
-            if start_graph["dateTime"] < cutoff_date_str:
+            # Use the Arizona time string for the 60-day cutoff comparison
+            if start_graph["dateTime"] < cutoff_date_local_str:
                 continue 
 
             pco_uid = str(component.get('uid'))
@@ -141,7 +160,6 @@ def sync_calendars():
 
             if pco_uid in graph_events:
                 existing = graph_events[pco_uid]
-                # Check if times changed, OR if the category hasn't been applied yet
                 if (existing["subject"] != summary or 
                     existing["start"] != start_graph["dateTime"] or 
                     existing["end"] != end_graph["dateTime"] or
@@ -154,7 +172,7 @@ def sync_calendars():
                         print(f"  -> Failed to update: {res_patch.text}")
             else:
                 if fingerprint in all_fingerprints:
-                    print(f"Re-linking existing event (UID shifted or tag missing): {summary}")
+                    print(f"Re-linking existing event: {summary}")
                     existing_id = all_fingerprints[fingerprint]
                     patch_url = f"{endpoint}/{existing_id}"
                     
