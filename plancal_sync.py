@@ -10,6 +10,10 @@ CLIENT_ID = os.environ["CLIENT_ID"]
 CLIENT_SECRET = os.environ["CLIENT_SECRET"]
 GROUP_ID = os.environ["GROUP_ID"]
 
+print(f"Debug - Client ID length: {len(CLIENT_ID)}")
+print(f"Debug - Tenant ID length: {len(TENANT_ID)}")
+print(f"Debug - Secret length: {len(CLIENT_SECRET)}")
+
 # Map feeds to their respective prefixes
 PCO_FEEDS = [
     {
