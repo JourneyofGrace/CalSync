@@ -2,25 +2,14 @@ import os
 import requests
 import msal
 from icalendar import Calendar
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 # --- Configuration ---
-TENANT_ID = os.environ["TENANT_ID"].strip().replace('"', '').replace("'", "")
-CLIENT_ID = os.environ["CLIENT_ID"].strip().replace('"', '').replace("'", "")
-
-raw_secret = os.environ["CLIENT_SECRET"]
-
-# Safely print the "wrapper" characters to the log without exposing the middle of the secret
-print(f"Debug - Secret starts with (repr): {repr(raw_secret[:3])}")
-print(f"Debug - Secret ends with (repr): {repr(raw_secret[-3:])}")
-
-# Aggressively scrub literal slashes, quotes, and whitespace
-CLIENT_SECRET = raw_secret.replace('"', '').replace("'", "").replace('\\n', '').replace('\\r', '').strip()
-
-GROUP_ID = os.environ["GROUP_ID"].strip().replace('"', '').replace("'", "")
-print(f"Debug - Client ID length: {len(CLIENT_ID)}")
-print(f"Debug - Tenant ID length: {len(TENANT_ID)}")
-print(f"Debug - Secret length: {len(CLIENT_SECRET)}")
+# Aggressively sanitize environment variables to prevent hidden CI/CD formatting errors
+TENANT_ID = os.environ["TENANT_ID"].strip().replace('"', '').replace("'", "").replace('\\n', '').replace('\\r', '')
+CLIENT_ID = os.environ["CLIENT_ID"].strip().replace('"', '').replace("'", "").replace('\\n', '').replace('\\r', '')
+CLIENT_SECRET = os.environ["CLIENT_SECRET"].strip().replace('"', '').replace("'", "").replace('\\n', '').replace('\\r', '')
+GROUP_ID = os.environ["GROUP_ID"].strip().replace('"', '').replace("'", "").replace('\\n', '').replace('\\r', '')
 
 # Map feeds to their respective prefixes
 PCO_FEEDS = [
@@ -58,7 +47,8 @@ def format_graph_datetime(dt_obj):
 
 def get_existing_group_events(headers):
     """Fetches existing group events that contain our custom PCO metadata extension."""
-    start_date = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%dT00:00:00Z")
+    # Using timezone.utc to prevent deprecation warnings in Python 3.11+
+    start_date = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT00:00:00Z")
     url = f"https://graph.microsoft.com/v1.0/groups/{GROUP_ID}/calendar/events?$expand=extensions($filter=id eq '{EXTENSION_NAME}')&$filter=start/dateTime ge '{start_date}'&$top=1000"
     
     existing_map = {}
@@ -136,7 +126,10 @@ def sync_calendars():
                     
                     print(f"Updating shifted event: {summary}")
                     patch_url = f"{endpoint}/{existing['id']}"
-                    requests.patch(patch_url, headers=headers, json=event_payload)
+                    res_patch = requests.patch(patch_url, headers=headers, json=event_payload)
+                    
+                    if res_patch.status_code not in [200, 204]:
+                        print(f"  -> Failed to update: {res_patch.text}")
             else:
                 print(f"Creating new event: {summary}")
                 event_payload["extensions"] = [
@@ -146,13 +139,19 @@ def sync_calendars():
                         "pcoUid": pco_uid
                     }
                 ]
-                requests.post(endpoint, headers=headers, json=event_payload)
+                res_post = requests.post(endpoint, headers=headers, json=event_payload)
+                
+                if res_post.status_code not in [200, 201]:
+                    print(f"  -> Failed to create: {res_post.text}")
 
     for old_pco_uid, event_meta in graph_events.items():
         if old_pco_uid not in pco_current_uids:
             print(f"Purging canceled/deleted event: {event_meta['subject']}")
             delete_url = f"{endpoint}/{event_meta['id']}"
-            requests.delete(delete_url, headers=headers)
+            res_delete = requests.delete(delete_url, headers=headers)
+            
+            if res_delete.status_code != 204:
+                print(f"  -> Failed to delete: {res_delete.text}")
 
     print("Sync process completed successfully.")
 
