@@ -5,11 +5,19 @@ from icalendar import Calendar
 from datetime import date, datetime, timedelta
 
 # --- Configuration ---
-TENANT_ID = os.environ["TENANT_ID"].strip().strip('"').strip("'")
-CLIENT_ID = os.environ["CLIENT_ID"].strip().strip('"').strip("'")
-CLIENT_SECRET = os.environ["CLIENT_SECRET"].strip().strip('"').strip("'")
-GROUP_ID = os.environ["GROUP_ID"].strip().strip('"').strip("'")
+TENANT_ID = os.environ["TENANT_ID"].strip().replace('"', '').replace("'", "")
+CLIENT_ID = os.environ["CLIENT_ID"].strip().replace('"', '').replace("'", "")
 
+raw_secret = os.environ["CLIENT_SECRET"]
+
+# Safely print the "wrapper" characters to the log without exposing the middle of the secret
+print(f"Debug - Secret starts with (repr): {repr(raw_secret[:3])}")
+print(f"Debug - Secret ends with (repr): {repr(raw_secret[-3:])}")
+
+# Aggressively scrub literal slashes, quotes, and whitespace
+CLIENT_SECRET = raw_secret.replace('"', '').replace("'", "").replace('\\n', '').replace('\\r', '').strip()
+
+GROUP_ID = os.environ["GROUP_ID"].strip().replace('"', '').replace("'", "")
 print(f"Debug - Client ID length: {len(CLIENT_ID)}")
 print(f"Debug - Tenant ID length: {len(TENANT_ID)}")
 print(f"Debug - Secret length: {len(CLIENT_SECRET)}")
