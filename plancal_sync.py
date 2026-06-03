@@ -5,11 +5,10 @@ from icalendar import Calendar
 from datetime import date, datetime, timedelta, timezone
 
 # --- Configuration ---
-# Aggressively sanitize environment variables to prevent hidden CI/CD formatting errors
 TENANT_ID = os.environ["TENANT_ID"].strip().replace('"', '').replace("'", "").replace('\\n', '').replace('\\r', '')
 CLIENT_ID = os.environ["CLIENT_ID"].strip().replace('"', '').replace("'", "").replace('\\n', '').replace('\\r', '')
 CLIENT_SECRET = os.environ["CLIENT_SECRET"].strip().replace('"', '').replace("'", "").replace('\\n', '').replace('\\r', '')
-GROUP_ID = os.environ["GROUP_ID"].strip().replace('"', '').replace("'", "").replace('\\n', '').replace('\\r', '')
+TARGET_MAILBOX = os.environ["TARGET_MAILBOX"].strip().replace('"', '').replace("'", "").replace('\\n', '').replace('\\r', '')
 
 # Map feeds to their respective prefixes
 PCO_FEEDS = [
@@ -45,11 +44,10 @@ def format_graph_datetime(dt_obj):
     elif isinstance(dt_obj, date):
         return {"dateTime": dt_obj.strftime("%Y-%m-%dT00:00:00"), "timeZone": "UTC"}
 
-def get_existing_group_events(headers):
-    """Fetches existing group events that contain our custom PCO metadata extension."""
-    # Using timezone.utc to prevent deprecation warnings in Python 3.11+
+def get_existing_events(headers):
+    """Fetches existing mailbox events that contain our custom PCO metadata extension."""
     start_date = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT00:00:00Z")
-    url = f"https://graph.microsoft.com/v1.0/groups/{GROUP_ID}/calendar/events?$expand=extensions($filter=id eq '{EXTENSION_NAME}')&$filter=start/dateTime ge '{start_date}'&$top=1000"
+    url = f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/calendar/events?$expand=extensions($filter=id eq '{EXTENSION_NAME}')&$filter=start/dateTime ge '{start_date}'&$top=1000"
     
     existing_map = {}
     while url:
@@ -80,11 +78,11 @@ def sync_calendars():
         "Content-Type": "application/json"
     }
     
-    print("Mapping existing Office 365 Group Calendar states...")
-    graph_events = get_existing_group_events(headers)
+    print(f"Mapping existing calendar states for {TARGET_MAILBOX}...")
+    graph_events = get_existing_events(headers)
     
     pco_current_uids = set()
-    endpoint = f"https://graph.microsoft.com/v1.0/groups/{GROUP_ID}/events"
+    endpoint = f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/events"
 
     for feed in PCO_FEEDS:
         print(f"Processing remote feed: {feed['url']}")
@@ -104,7 +102,6 @@ def sync_calendars():
             pco_current_uids.add(pco_uid)
             
             raw_summary = str(component.get('summary', 'Untitled Event'))
-            # Inject the emoji prefix
             summary = f"{feed['prefix']}{raw_summary}"
             description = str(component.get('description', ''))
             
