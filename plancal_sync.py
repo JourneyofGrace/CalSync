@@ -11,7 +11,7 @@ CLIENT_ID = os.environ["CLIENT_ID"].strip().replace('"', '').replace("'", "").re
 CLIENT_SECRET = os.environ["CLIENT_SECRET"].strip().replace('"', '').replace("'", "").replace('\\n', '').replace('\\r', '')
 TARGET_MAILBOX = os.environ["TARGET_MAILBOX"].strip().replace('"', '').replace("'", "").replace('\\n', '').replace('\\r', '')
 
-# Timezone Configuration (Arizona does not observe DST)
+# Timezone Configuration
 LOCAL_TZ = ZoneInfo("America/Phoenix")
 GRAPH_TZ_STRING = "America/Phoenix"
 
@@ -42,23 +42,49 @@ def get_graph_token():
         return result["access_token"]
     raise Exception(f"Failed to acquire token: {result.get('error_description')}")
 
+def setup_category_colors(headers):
+    """Programs the Shared Mailbox to assign specific colors to our categories."""
+    print(f"Verifying Master Category colors for {TARGET_MAILBOX}...")
+    url = f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/outlook/masterCategories"
+    
+    # Microsoft Graph Color Presets: preset9 = Blue, preset4 = Green
+    desired_categories = {
+        "Church Events": "preset9", 
+        "Office Events": "preset4"
+    }
+    
+    res = requests.get(url, headers=headers)
+    
+    # Fail gracefully if the Entra ID app lacks MailboxSettings.ReadWrite
+    if res.status_code == 403:
+        print("  -> Notice: App lacks 'MailboxSettings.ReadWrite' permission. Colors must be set manually in Outlook.")
+        return
+    elif res.status_code != 200:
+        print(f"  -> Warning: Could not fetch master categories: {res.text}")
+        return
+
+    existing_cats = {c["displayName"]: c for c in res.json().get("value", [])}
+
+    for name, color in desired_categories.items():
+        if name not in existing_cats:
+            requests.post(url, headers=headers, json={"displayName": name, "color": color})
+            print(f"  -> Created Master Category '{name}' with color {color}")
+        else:
+            if existing_cats[name].get("color") != color:
+                cat_id = existing_cats[name]["id"]
+                requests.patch(f"{url}/{cat_id}", headers=headers, json={"color": color})
+                print(f"  -> Updated Master Category '{name}' to color {color}")
+
 def format_graph_datetime(dt_obj):
-    """Converts icalendar date/datetime components strictly to America/Phoenix time."""
     if isinstance(dt_obj, datetime):
-        # If PCO sends a naive datetime, assume UTC to be safe before converting
         if dt_obj.tzinfo is None:
             dt_obj = dt_obj.replace(tzinfo=timezone.utc)
-        
-        # Convert mathematically to Arizona time
         local_dt = dt_obj.astimezone(LOCAL_TZ)
         return {"dateTime": local_dt.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": GRAPH_TZ_STRING}
     elif isinstance(dt_obj, date):
-        # All-day events get pinned to midnight Arizona time
         return {"dateTime": dt_obj.strftime("%Y-%m-%dT00:00:00"), "timeZone": GRAPH_TZ_STRING}
 
 def get_existing_events(headers, cutoff_date_utc_str):
-    """Fetches events within the sync window using the Arizona timezone header."""
-    # The Graph API filter requires UTC, so we pass the UTC string here
     url = f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/events?$expand=extensions($filter=id eq '{EXTENSION_NAME}')&$filter=start/dateTime ge '{cutoff_date_utc_str}'&$top=1000"
     
     graph_events = {}
@@ -76,8 +102,6 @@ def get_existing_events(headers, cutoff_date_utc_str):
             pco_uid = next((ext.get("pcoUid") for ext in extensions if ext.get("id") == EXTENSION_NAME), None)
             
             subject = event.get("subject", "Untitled Event")
-            
-            # Because of our headers, Graph returns these strings already converted to Arizona time
             start_str = event.get("start", {}).get("dateTime", "")[:19]
             end_str = event.get("end", {}).get("dateTime", "")[:19]
             
@@ -98,18 +122,18 @@ def get_existing_events(headers, cutoff_date_utc_str):
 def sync_calendars():
     token = get_graph_token()
     
-    # We instruct Microsoft Graph to speak to us strictly in Arizona Time
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
         "Prefer": f'outlook.timezone="{GRAPH_TZ_STRING}"'
     }
     
-    # Graph API backend filtering requires a pure UTC timestamp
+    # Trigger the color setup before processing events
+    setup_category_colors(headers)
+    
     cutoff_date_utc = datetime.now(timezone.utc) - timedelta(days=60)
     cutoff_date_utc_str = cutoff_date_utc.strftime("%Y-%m-%dT00:00:00Z")
     
-    # Our internal python comparison needs an Arizona timestamp to match the PCO feed
     cutoff_date_local = datetime.now(LOCAL_TZ) - timedelta(days=60)
     cutoff_date_local_str = cutoff_date_local.strftime("%Y-%m-%dT00:00:00")
     
@@ -136,7 +160,6 @@ def sync_calendars():
             start_graph = format_graph_datetime(component.get('dtstart').dt)
             end_graph = format_graph_datetime(component.get('dtend').dt)
             
-            # Use the Arizona time string for the 60-day cutoff comparison
             if start_graph["dateTime"] < cutoff_date_local_str:
                 continue 
 
