@@ -10,7 +10,6 @@ CLIENT_ID = os.environ["CLIENT_ID"].strip().replace('"', '').replace("'", "").re
 CLIENT_SECRET = os.environ["CLIENT_SECRET"].strip().replace('"', '').replace("'", "").replace('\\n', '').replace('\\r', '')
 TARGET_MAILBOX = os.environ["TARGET_MAILBOX"].strip().replace('"', '').replace("'", "").replace('\\n', '').replace('\\r', '')
 
-# Map feeds to their respective prefixes
 PCO_FEEDS = [
     {
         "url": "https://calendar.planningcenteronline.com/icals/eJxj4ajmsGLLz2TO62Sy4kotzi8oqWa34khOzPFU4jY0MzI3M2OzYnMNsWIrzWQ2r4624i5ILErMLa5mAAClxQ8Kc13fbb9a4c94004a94cf9db15e7aa867aa2dcb22",
@@ -22,9 +21,7 @@ PCO_FEEDS = [
     }
 ]
 
-# Unique namespace for your schema extension inside your tenant
 EXTENSION_NAME = "org.church.pcoSync"
-
 AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
 SCOPES = ["https://graph.microsoft.com/.default"]
 
@@ -38,18 +35,22 @@ def get_graph_token():
     raise Exception(f"Failed to acquire token: {result.get('error_description')}")
 
 def format_graph_datetime(dt_obj):
-    """Normalizes icalendar date/datetime components to UTC Graph strings."""
+    """Normalizes icalendar date/datetime components strictly to UTC Graph strings."""
     if isinstance(dt_obj, datetime):
+        if dt_obj.tzinfo is not None:
+            dt_obj = dt_obj.astimezone(timezone.utc)
         return {"dateTime": dt_obj.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": "UTC"}
     elif isinstance(dt_obj, date):
         return {"dateTime": dt_obj.strftime("%Y-%m-%dT00:00:00"), "timeZone": "UTC"}
 
 def get_existing_events(headers):
-    """Fetches existing mailbox events that contain our custom PCO metadata extension."""
-    start_date = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT00:00:00Z")
-    url = f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/calendar/events?$expand=extensions($filter=id eq '{EXTENSION_NAME}')&$filter=start/dateTime ge '{start_date}'&$top=1000"
+    """Fetches ALL events to map UIDs and build a Title+Time fingerprint to catch clones."""
+    # Removed time filters to guarantee total visibility
+    url = f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/events?$expand=extensions($filter=id eq '{EXTENSION_NAME}')&$top=1000"
     
-    existing_map = {}
+    graph_events = {}
+    all_fingerprints = {}
+    
     while url:
         response = requests.get(url, headers=headers)
         if response.status_code != 200:
@@ -61,15 +62,23 @@ def get_existing_events(headers):
             extensions = event.get("extensions", [])
             pco_uid = next((ext.get("pcoUid") for ext in extensions if ext.get("id") == EXTENSION_NAME), None)
             
+            subject = event.get("subject", "Untitled Event")
+            start_str = event.get("start", {}).get("dateTime", "")[:19]
+            end_str = event.get("end", {}).get("dateTime", "")[:19]
+            
+            # Build the anti-duplication fingerprint
+            fp = f"{subject}_{start_str}"
+            all_fingerprints[fp] = event["id"]
+            
             if pco_uid:
-                existing_map[pco_uid] = {
+                graph_events[pco_uid] = {
                     "id": event["id"],
-                    "subject": event["subject"],
-                    "start": event["start"]["dateTime"][:19],
-                    "end": event["end"]["dateTime"][:19]
+                    "subject": subject,
+                    "start": start_str,
+                    "end": end_str
                 }
         url = data.get("@odata.nextLink")
-    return existing_map
+    return graph_events, all_fingerprints
 
 def sync_calendars():
     token = get_graph_token()
@@ -79,7 +88,11 @@ def sync_calendars():
     }
     
     print(f"Mapping existing calendar states for {TARGET_MAILBOX}...")
-    graph_events = get_existing_events(headers)
+    graph_events, all_fingerprints = get_existing_events(headers)
+    
+    # Ignore PCO feed events older than 60 days
+    cutoff_date = datetime.now(timezone.utc) - timedelta(days=60)
+    cutoff_date_str = cutoff_date.strftime("%Y-%m-%dT00:00:00")
     
     pco_current_uids = set()
     endpoint = f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/events"
@@ -98,6 +111,12 @@ def sync_calendars():
             if not component.get('uid'):
                 continue
                 
+            start_graph = format_graph_datetime(component.get('dtstart').dt)
+            end_graph = format_graph_datetime(component.get('dtend').dt)
+            
+            if start_graph["dateTime"] < cutoff_date_str:
+                continue 
+
             pco_uid = str(component.get('uid'))
             pco_current_uids.add(pco_uid)
             
@@ -105,15 +124,14 @@ def sync_calendars():
             summary = f"{feed['prefix']}{raw_summary}"
             description = str(component.get('description', ''))
             
-            start_graph = format_graph_datetime(component.get('dtstart').dt)
-            end_graph = format_graph_datetime(component.get('dtend').dt)
-            
             event_payload = {
                 "subject": summary,
                 "body": {"contentType": "Text", "content": description},
                 "start": start_graph,
                 "end": end_graph,
             }
+
+            fingerprint = f"{summary}_{start_graph['dateTime']}"
 
             if pco_uid in graph_events:
                 existing = graph_events[pco_uid]
@@ -124,29 +142,46 @@ def sync_calendars():
                     print(f"Updating shifted event: {summary}")
                     patch_url = f"{endpoint}/{existing['id']}"
                     res_patch = requests.patch(patch_url, headers=headers, json=event_payload)
-                    
                     if res_patch.status_code not in [200, 204]:
                         print(f"  -> Failed to update: {res_patch.text}")
             else:
-                print(f"Creating new event: {summary}")
-                event_payload["extensions"] = [
-                    {
-                        "@odata.type": "microsoft.graph.openTypeExtension",
-                        "extensionName": EXTENSION_NAME,
-                        "pcoUid": pco_uid
-                    }
-                ]
-                res_post = requests.post(endpoint, headers=headers, json=event_payload)
-                
-                if res_post.status_code not in [200, 201]:
-                    print(f"  -> Failed to create: {res_post.text}")
+                # UID not found. Check the fingerprint to ensure we aren't creating a clone.
+                if fingerprint in all_fingerprints:
+                    print(f"Re-linking existing event (UID shifted or tag missing): {summary}")
+                    existing_id = all_fingerprints[fingerprint]
+                    patch_url = f"{endpoint}/{existing_id}"
+                    
+                    event_payload["extensions"] = [
+                        {
+                            "@odata.type": "microsoft.graph.openTypeExtension",
+                            "extensionName": EXTENSION_NAME,
+                            "pcoUid": pco_uid
+                        }
+                    ]
+                    requests.patch(patch_url, headers=headers, json=event_payload)
+                    
+                    # Protect this re-linked ID from being purged
+                    stale_uids = [k for k, v in graph_events.items() if v["id"] == existing_id]
+                    for k in stale_uids:
+                        del graph_events[k]
+                else:
+                    print(f"Creating new event: {summary}")
+                    event_payload["extensions"] = [
+                        {
+                            "@odata.type": "microsoft.graph.openTypeExtension",
+                            "extensionName": EXTENSION_NAME,
+                            "pcoUid": pco_uid
+                        }
+                    ]
+                    res_post = requests.post(endpoint, headers=headers, json=event_payload)
+                    if res_post.status_code not in [200, 201]:
+                        print(f"  -> Failed to create: {res_post.text}")
 
     for old_pco_uid, event_meta in graph_events.items():
         if old_pco_uid not in pco_current_uids:
             print(f"Purging canceled/deleted event: {event_meta['subject']}")
             delete_url = f"{endpoint}/{event_meta['id']}"
             res_delete = requests.delete(delete_url, headers=headers)
-            
             if res_delete.status_code != 204:
                 print(f"  -> Failed to delete: {res_delete.text}")
 
