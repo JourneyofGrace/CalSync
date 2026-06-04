@@ -27,8 +27,7 @@ jobs:
           TENANT_ID: ${{ secrets.TENANT_ID }}
           CLIENT_ID: ${{ secrets.CLIENT_ID }}
           CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
-          # Update to TARGET_MAILBOX if you stayed with the Shared Mailbox
-          TARGET_GROUP_ID: ${{ secrets.TARGET_GROUP_ID }}
+          TARGET_MAILBOX: ${{ secrets.TARGET_MAILBOX }}
         run: |
           # Loop 7 times to fill out the hour without overlapping
           for i in {1..7}
