@@ -2,33 +2,47 @@ name: PlanCent to Off365 Calendar Sync
 
 on:
   schedule:
-    # Runs every 30 minutes
-    - cron: '*/30 * * * *'
-  workflow_dispatch: # Allows manual triggering from the GitHub UI
+    # Triggers exactly once per hour
+    - cron: '0 * * * *'
+  workflow_dispatch: # Keeps the manual button active
 
 jobs:
-  sync-calendars:
+  sync_loop:
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 60
     steps:
-      - name: Checkout Repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip' # Speeds up the run by caching dependencies
 
       - name: Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+        run: pip install requests msal icalendar zoneinfo
 
-      - name: Execute Sync Script
+      - name: Execute 8-Minute Sync Loops
         env:
           TENANT_ID: ${{ secrets.TENANT_ID }}
           CLIENT_ID: ${{ secrets.CLIENT_ID }}
           CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
-          TARGET_MAILBOX: ${{ secrets.TARGET_MAILBOX }}
-        run: python plancal_sync.py
+          # Update to TARGET_MAILBOX if you stayed with the Shared Mailbox
+          TARGET_GROUP_ID: ${{ secrets.TARGET_GROUP_ID }}
+        run: |
+          # Loop 7 times to fill out the hour without overlapping
+          for i in {1..7}
+          do
+            echo "--- Starting Sync Cycle $i of 7 ---"
+
+            # Run your python script
+            python plancal_sync.py
+
+            # If it is not the final loop, pause the runner for exactly 8 minutes
+            if [ $i -lt 7 ]; then
+              echo "Cycle $i complete. Sleeping for 8 minutes (480 seconds)..."
+              sleep 480
+            fi
+          done
+
+          echo "Hourly batch complete. Runner shutting down."
