@@ -20,7 +20,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install Dependencies
-        run: pip install requests msal icalendar zoneinfo
+        run: pip install requests msal icalendar
 
       - name: Execute 8-Minute Sync Loops
         env:
