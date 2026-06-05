@@ -32,13 +32,13 @@ jobs:
           # Loop 7 times to fill out the hour without overlapping
           for i in {1..7}
           do
-            echo "--- Starting Sync Cycle $i of 7 ---"
+            echo "--- Starting Sync Cycle $i of 6 ---"
 
             # Run your python script
             python plancal_sync.py
 
             # If it is not the final loop, pause the runner for exactly 8 minutes
-            if [ $i -lt 7 ]; then
+            if [ $i -lt 6 ]; then
               echo "Cycle $i complete. Sleeping for 8 minutes (480 seconds)..."
               sleep 480
             fi
