@@ -106,7 +106,7 @@ def get_existing_events(headers, cutoff_date_utc_str):
             end_str = event.get("end", {}).get("dateTime", "")[:19]
             
             fp = f"{subject}_{start_str}"
-            all_fingerprints[fp] = event["id"]
+            all_fingerprints[fp] = {"id": event["id"], "subject": subject}
             
             if pco_uid:
                 graph_events[pco_uid] = {
@@ -118,6 +118,15 @@ def get_existing_events(headers, cutoff_date_utc_str):
                 }
         url = data.get("@odata.nextLink")
     return graph_events, all_fingerprints
+
+def build_extension_payload(pco_uid):
+    return [
+        {
+            "@odata.type": "microsoft.graph.openTypeExtension",
+            "extensionName": EXTENSION_NAME,
+            "pcoUid": pco_uid
+        }
+    ]
 
 def sync_calendars():
     token = get_graph_token()
@@ -142,6 +151,7 @@ def sync_calendars():
     
     pco_current_uids = set()
     endpoint = f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/events"
+    protected_ids = set()
 
     for feed in PCO_FEEDS:
         print(f"Processing remote feed: {feed['url']} (Category: {feed['category']})")
@@ -195,37 +205,50 @@ def sync_calendars():
                         print(f"  -> Failed to update: {res_patch.text}")
             else:
                 if fingerprint in all_fingerprints:
+                    # Extension can't be attached via PATCH; update + re-create
+                    # the event so the UID link finally sticks.
                     print(f"Re-linking existing event: {summary}")
-                    existing_id = all_fingerprints[fingerprint]
-                    patch_url = f"{endpoint}/{existing_id}"
-                    
-                    event_payload["extensions"] = [
-                        {
-                            "@odata.type": "microsoft.graph.openTypeExtension",
-                            "extensionName": EXTENSION_NAME,
-                            "pcoUid": pco_uid
-                        }
-                    ]
-                    requests.patch(patch_url, headers=headers, json=event_payload)
-                    
+                    existing_id = all_fingerprints[fingerprint]["id"]
+                    requests.delete(f"{endpoint}/{existing_id}", headers=headers)
+                    protected_ids.add(existing_id)
+
+                    event_payload["extensions"] = build_extension_payload(pco_uid)
+                    res_post = requests.post(endpoint, headers=headers, json=event_payload)
+                    if res_post.status_code not in [200, 201]:
+                        print(f"  -> Failed to re-link create: {res_post.text}")
+
+                    # Remove every stale map entry that pointed at the old id
                     stale_uids = [k for k, v in graph_events.items() if v["id"] == existing_id]
                     for k in stale_uids:
                         del graph_events[k]
+                    all_fingerprints.pop(fingerprint, None)
+                    if res_post.status_code in [200, 201]:
+                        new_ev = res_post.json()
+                        graph_events[pco_uid] = {
+                            "id": new_ev["id"],
+                            "subject": summary,
+                            "start": start_graph["dateTime"],
+                            "end": end_graph["dateTime"],
+                            "categories": [target_category]
+                        }
                 else:
                     print(f"Creating new event: {summary}")
-                    event_payload["extensions"] = [
-                        {
-                            "@odata.type": "microsoft.graph.openTypeExtension",
-                            "extensionName": EXTENSION_NAME,
-                            "pcoUid": pco_uid
-                        }
-                    ]
+                    event_payload["extensions"] = build_extension_payload(pco_uid)
                     res_post = requests.post(endpoint, headers=headers, json=event_payload)
                     if res_post.status_code not in [200, 201]:
                         print(f"  -> Failed to create: {res_post.text}")
+                    else:
+                        new_ev = res_post.json()
+                        graph_events[pco_uid] = {
+                            "id": new_ev["id"],
+                            "subject": summary,
+                            "start": start_graph["dateTime"],
+                            "end": end_graph["dateTime"],
+                            "categories": [target_category]
+                        }
 
     for old_pco_uid, event_meta in graph_events.items():
-        if old_pco_uid not in pco_current_uids:
+        if old_pco_uid not in pco_current_uids and event_meta["id"] not in protected_ids:
             print(f"Purging canceled/deleted event: {event_meta['subject']}")
             delete_url = f"{endpoint}/{event_meta['id']}"
             res_delete = requests.delete(delete_url, headers=headers)

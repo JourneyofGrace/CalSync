@@ -22,26 +22,12 @@ jobs:
       - name: Install Dependencies
         run: pip install requests msal icalendar
 
-      - name: Execute 8-Minute Sync Loops
+      - name: Execute Sync Cycles
         env:
           TENANT_ID: ${{ secrets.TENANT_ID }}
           CLIENT_ID: ${{ secrets.CLIENT_ID }}
           CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
           TARGET_MAILBOX: ${{ secrets.TARGET_MAILBOX }}
         run: |
-          # Loop 7 times to fill out the hour without overlapping
-          for i in {1..7}
-          do
-            echo "--- Starting Sync Cycle $i of 6 ---"
-
-            # Run your python script
-            python plancal_sync.py
-
-            # If it is not the final loop, pause the runner for exactly 8 minutes
-            if [ $i -lt 6 ]; then
-              echo "Cycle $i complete. Sleeping for 8 minutes (480 seconds)..."
-              sleep 480
-            fi
-          done
-
-          echo "Hourly batch complete. Runner shutting down."
+          # Single clean pass: re-link on first run, then pure updates/purges
+          python plancal_sync.py
