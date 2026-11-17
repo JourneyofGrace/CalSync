@@ -33,13 +33,11 @@ PCO_FEEDS = [
 
 EXTENSION_NAME = "org.church.pcoSync"
 # Outlook resources store open extensions under the legacy fully-qualified id
-# ("Microsoft.OutlookServices.OpenTypeExtension.<name>"); newer responses can
-# use the "microsoft.graph.openTypeExtension." prefix. $expand requires one of
-# these ids in its filter, so query both and merge.
-EXTENSION_FILTER_IDS = [
-    f"Microsoft.OutlookServices.OpenTypeExtension.{EXTENSION_NAME}",
-    f"microsoft.graph.openTypeExtension.{EXTENSION_NAME}",
-]
+# ("Microsoft.OutlookServices.OpenTypeExtension.<name>"). $expand requires this
+# id in its filter and cannot be used bare (ErrorGraphExtensionExpandRequiresFilter).
+# The "microsoft.graph." prefix is NOT accepted for Outlook events: it returns
+# HTTP 500 "Cannot be more than 62 chars long. (Parameter 'name')".
+EXTENSION_FILTER_ID = f"Microsoft.OutlookServices.OpenTypeExtension.{EXTENSION_NAME}"
 AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
 SCOPES = ["https://graph.microsoft.com/.default"]
 
@@ -138,25 +136,11 @@ def _fetch_events_for_extension(headers, cutoff_date_utc_str, extension_id):
 
 def get_existing_events(headers, cutoff_date_utc_str):
     # $expand=extensions *requires* a server-side id filter; it cannot be used
-    # bare (ErrorGraphExtensionExpandRequiresFilter). Query the documented
-    # Outlook prefix first, then the newer microsoft.graph prefix as fallback.
-    events_by_id = {}
-    for index, extension_id in enumerate(EXTENSION_FILTER_IDS):
-        try:
-            fetched = _fetch_events_for_extension(headers, cutoff_date_utc_str, extension_id)
-        except RuntimeError as exc:
-            if index == 0:
-                raise
-            print(f"  Warning: fallback extension query failed: {exc}")
-            continue
-        for event_id, event in fetched.items():
-            if event_id not in events_by_id:
-                events_by_id[event_id] = event
-                continue
-            have = {e.get("id") for e in events_by_id[event_id].get("extensions", [])}
-            for ext in event.get("extensions", []):
-                if ext.get("id") not in have:
-                    events_by_id[event_id].setdefault("extensions", []).append(ext)
+    # bare (ErrorGraphExtensionExpandRequiresFilter). Outlook accepts the
+    # legacy Microsoft.OutlookServices prefix used below.
+    events_by_id = _fetch_events_for_extension(
+        headers, cutoff_date_utc_str, EXTENSION_FILTER_ID
+    )
 
     graph_events = {}
     all_fingerprints = {}
@@ -196,6 +180,11 @@ def get_existing_events(headers, cutoff_date_utc_str):
                 "categories": event.get("categories", []),
                 "isAllDay": bool(event.get("isAllDay", False))
             }
+
+    print(
+        f"  -> Found {len(graph_events)} linked event(s) and "
+        f"{len(all_fingerprints)} total calendar fingerprint(s)."
+    )
     return graph_events, all_fingerprints
 
 def build_extension_object(pco_uid):
