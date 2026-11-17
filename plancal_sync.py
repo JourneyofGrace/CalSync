@@ -266,7 +266,9 @@ def sync_calendars():
 
     if duplicate_ids:
         # Safety cap so a large backlog cannot run past the workflow timeout.
-        max_dup_deletes = int(os.environ.get("MAX_DUP_DELETES_PER_RUN", "500"))
+        # 10,000 is enough to clear the one-time backlog from the old churn in
+        # a single run; normal runs will have zero duplicates.
+        max_dup_deletes = int(os.environ.get("MAX_DUP_DELETES_PER_RUN", "10000"))
         to_delete = duplicate_ids[:max_dup_deletes]
         print(f"Removing {len(to_delete)} duplicate calendar event(s)...")
         removed = 0
