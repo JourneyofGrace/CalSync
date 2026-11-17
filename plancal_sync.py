@@ -144,6 +144,7 @@ def get_existing_events(headers, cutoff_date_utc_str):
 
     graph_events = {}
     all_fingerprints = {}
+    uid_copies = {}
 
     for event in events_by_id.values():
         extensions = event.get("extensions", [])
@@ -172,20 +173,60 @@ def get_existing_events(headers, cutoff_date_utc_str):
         }
 
         if pco_uid:
-            graph_events[pco_uid] = {
+            meta = {
                 "id": event["id"],
                 "subject": subject,
                 "start": start_str,
                 "end": end_str,
                 "categories": event.get("categories", []),
-                "isAllDay": bool(event.get("isAllDay", False))
+                "isAllDay": bool(event.get("isAllDay", False)),
+                "lastModified": event.get("lastModifiedDateTime", ""),
+                "type": event.get("type", ""),
             }
+            uid_copies.setdefault(pco_uid, []).append(meta)
+            # Keep the most recently modified copy as the canonical event.
+            current = graph_events.get(pco_uid)
+            if not current or meta["lastModified"] > current.get("lastModified", ""):
+                graph_events[pco_uid] = meta
+
+    # Every extra copy sharing a PCO UID is a duplicate left behind by the old
+    # delete/recreate sync. Collect them so the caller can delete them in one
+    # pass instead of deleting a single copy per run.
+    duplicate_ids = []
+    duplicate_groups = 0
+    for uid, copies in uid_copies.items():
+        if len(copies) > 1:
+            types = {copy["type"] for copy in copies}
+            if types - {"singleInstance", ""}:
+                # Never touch recurring series/occurrences; only clean up
+                # plain single events left behind by the old sync.
+                print(
+                    f"    Skipping duplicate cleanup for UID {uid}: "
+                    f"non-single event type(s) {sorted(types)}"
+                )
+                continue
+            duplicate_groups += 1
+            keeper = graph_events[uid]
+            for copy in copies:
+                if copy["id"] != keeper["id"]:
+                    duplicate_ids.append(copy["id"])
+            if duplicate_groups <= 5:
+                print(
+                    f"    Duplicate UID {uid}: {len(copies)} copies, "
+                    f"type(s)={sorted({c['type'] for c in copies})}, "
+                    f"subject={keeper['subject']!r}"
+                )
 
     print(
         f"  -> Found {len(graph_events)} linked event(s) and "
         f"{len(all_fingerprints)} total calendar fingerprint(s)."
     )
-    return graph_events, all_fingerprints
+    if duplicate_ids:
+        print(
+            f"  -> Found {len(duplicate_ids)} duplicate cop(ies) across "
+            f"{duplicate_groups} PCO UID(s)."
+        )
+    return graph_events, all_fingerprints, duplicate_ids
 
 def build_extension_object(pco_uid):
     return {
@@ -216,10 +257,37 @@ def sync_calendars():
     cutoff_date_local_str = cutoff_date_local.strftime("%Y-%m-%dT00:00:00")
     
     print(f"Mapping existing calendar states for {TARGET_MAILBOX} (Looking back 60 days in {GRAPH_TZ_STRING})...")
-    graph_events, all_fingerprints = get_existing_events(headers, cutoff_date_utc_str)
+    graph_events, all_fingerprints, duplicate_ids = get_existing_events(
+        headers, cutoff_date_utc_str
+    )
     
     pco_current_uids = set()
     endpoint = f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/events"
+
+    if duplicate_ids:
+        # Safety cap so a large backlog cannot run past the workflow timeout.
+        max_dup_deletes = int(os.environ.get("MAX_DUP_DELETES_PER_RUN", "500"))
+        to_delete = duplicate_ids[:max_dup_deletes]
+        print(f"Removing {len(to_delete)} duplicate calendar event(s)...")
+        removed = 0
+        for dup_id in to_delete:
+            res_delete = graph_request(
+                "DELETE", f"{endpoint}/{dup_id}", headers=headers
+            )
+            if res_delete.status_code == 204:
+                removed += 1
+            else:
+                print(
+                    f"  -> Failed to delete duplicate {dup_id}: "
+                    f"{res_delete.status_code} {res_delete.text[:200]}"
+                )
+        print(f"  -> Removed {removed}/{len(to_delete)} duplicate(s).")
+        if len(duplicate_ids) > len(to_delete):
+            print(
+                f"  -> Deferring {len(duplicate_ids) - len(to_delete)} "
+                f"duplicate(s) to the next run."
+            )
+
     feeds_ok = True
 
     for feed in PCO_FEEDS:
