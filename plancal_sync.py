@@ -32,6 +32,14 @@ PCO_FEEDS = [
 ]
 
 EXTENSION_NAME = "org.church.pcoSync"
+# Outlook resources store open extensions under the legacy fully-qualified id
+# ("Microsoft.OutlookServices.OpenTypeExtension.<name>"); newer responses can
+# use the "microsoft.graph.openTypeExtension." prefix. $expand requires one of
+# these ids in its filter, so query both and merge.
+EXTENSION_FILTER_IDS = [
+    f"Microsoft.OutlookServices.OpenTypeExtension.{EXTENSION_NAME}",
+    f"microsoft.graph.openTypeExtension.{EXTENSION_NAME}",
+]
 AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
 SCOPES = ["https://graph.microsoft.com/.default"]
 
@@ -99,61 +107,95 @@ def format_graph_datetime(dt_obj):
     elif isinstance(dt_obj, date):
         return {"dateTime": dt_obj.strftime("%Y-%m-%dT00:00:00"), "timeZone": GRAPH_TZ_STRING}
 
-def get_existing_events(headers, cutoff_date_utc_str):
-    # Outlook stores open extensions under a fully-qualified id such as
-    # "microsoft.graph.openTypeExtension.org.church.pcoSync" (legacy tenants
-    # use the "Microsoft.OutlookServices.OpenTypeExtension." prefix), while
-    # extensionName stays the bare "org.church.pcoSync". Expand without an id
-    # filter and match extensionName instead of hard-coding the prefix.
-    url = f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/events?$expand=extensions&$filter=start/dateTime ge '{cutoff_date_utc_str}'&$top=1000"
-    
-    graph_events = {}
-    all_fingerprints = {}
-    
+def _fetch_events_for_extension(headers, cutoff_date_utc_str, extension_id):
+    """Fetch events that carry one specific open-extension id."""
+    url = (
+        f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/events"
+        f"?$expand=extensions($filter=id eq '{extension_id}')"
+        f"&$filter=start/dateTime ge '{cutoff_date_utc_str}'&$top=1000"
+    )
+    events = {}
     while url:
         response = graph_request("GET", url, headers=headers)
         if response.status_code != 200:
             # Abort rather than return a partial map: creating events from a
             # partial view would duplicate the entire calendar.
             raise RuntimeError(f"Error fetching existing events: {response.text}")
-        
+
         data = response.json()
         for event in data.get("value", []):
-            extensions = event.get("extensions", [])
-            pco_ext = next(
-                (
-                    ext
-                    for ext in extensions
-                    if ext.get("extensionName") == EXTENSION_NAME
-                    or str(ext.get("id", "")).endswith(EXTENSION_NAME)
-                ),
-                None,
-            )
-            pco_uid = pco_ext.get("pcoUid") if pco_ext else None
-            extension_id = pco_ext.get("id") if pco_ext else None
+            # Merge extensions if the same event comes back for both prefixes.
+            if event["id"] not in events:
+                events[event["id"]] = event
+            else:
+                have = {e.get("id") for e in events[event["id"]].get("extensions", [])}
+                for ext in event.get("extensions", []):
+                    if ext.get("id") not in have:
+                        events[event["id"]].setdefault("extensions", []).append(ext)
+        url = data.get("@odata.nextLink")
+    return events
 
-            subject = event.get("subject", "Untitled Event")
-            start_str = event.get("start", {}).get("dateTime", "")[:19]
-            end_str = event.get("end", {}).get("dateTime", "")[:19]
 
-            fp = f"{subject}_{start_str}"
-            all_fingerprints[fp] = {
+def get_existing_events(headers, cutoff_date_utc_str):
+    # $expand=extensions *requires* a server-side id filter; it cannot be used
+    # bare (ErrorGraphExtensionExpandRequiresFilter). Query the documented
+    # Outlook prefix first, then the newer microsoft.graph prefix as fallback.
+    events_by_id = {}
+    for index, extension_id in enumerate(EXTENSION_FILTER_IDS):
+        try:
+            fetched = _fetch_events_for_extension(headers, cutoff_date_utc_str, extension_id)
+        except RuntimeError as exc:
+            if index == 0:
+                raise
+            print(f"  Warning: fallback extension query failed: {exc}")
+            continue
+        for event_id, event in fetched.items():
+            if event_id not in events_by_id:
+                events_by_id[event_id] = event
+                continue
+            have = {e.get("id") for e in events_by_id[event_id].get("extensions", [])}
+            for ext in event.get("extensions", []):
+                if ext.get("id") not in have:
+                    events_by_id[event_id].setdefault("extensions", []).append(ext)
+
+    graph_events = {}
+    all_fingerprints = {}
+
+    for event in events_by_id.values():
+        extensions = event.get("extensions", [])
+        pco_ext = next(
+            (
+                ext
+                for ext in extensions
+                if ext.get("extensionName") == EXTENSION_NAME
+                or str(ext.get("id", "")).endswith(EXTENSION_NAME)
+            ),
+            None,
+        )
+        pco_uid = pco_ext.get("pcoUid") if pco_ext else None
+        extension_id = pco_ext.get("id") if pco_ext else None
+
+        subject = event.get("subject", "Untitled Event")
+        start_str = event.get("start", {}).get("dateTime", "")[:19]
+        end_str = event.get("end", {}).get("dateTime", "")[:19]
+
+        fp = f"{subject}_{start_str}"
+        all_fingerprints[fp] = {
+            "id": event["id"],
+            "subject": subject,
+            "extensionId": extension_id,
+            "pcoUid": pco_uid,
+        }
+
+        if pco_uid:
+            graph_events[pco_uid] = {
                 "id": event["id"],
                 "subject": subject,
-                "extensionId": extension_id,
-                "pcoUid": pco_uid,
+                "start": start_str,
+                "end": end_str,
+                "categories": event.get("categories", []),
+                "isAllDay": bool(event.get("isAllDay", False))
             }
-            
-            if pco_uid:
-                graph_events[pco_uid] = {
-                    "id": event["id"],
-                    "subject": subject,
-                    "start": start_str,
-                    "end": end_str,
-                    "categories": event.get("categories", []),
-                    "isAllDay": bool(event.get("isAllDay", False))
-                }
-        url = data.get("@odata.nextLink")
     return graph_events, all_fingerprints
 
 def build_extension_object(pco_uid):
