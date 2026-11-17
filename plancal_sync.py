@@ -145,6 +145,7 @@ def get_existing_events(headers, cutoff_date_utc_str):
     graph_events = {}
     all_fingerprints = {}
     uid_copies = {}
+    exact_groups = {}
 
     for event in events_by_id.values():
         extensions = event.get("extensions", [])
@@ -163,6 +164,10 @@ def get_existing_events(headers, cutoff_date_utc_str):
         subject = event.get("subject", "Untitled Event")
         start_str = event.get("start", {}).get("dateTime", "")[:19]
         end_str = event.get("end", {}).get("dateTime", "")[:19]
+
+        exact_groups.setdefault((subject, start_str, end_str), []).append(
+            {"id": event["id"], "pcoUid": pco_uid}
+        )
 
         fp = f"{subject}_{start_str}"
         all_fingerprints[fp] = {
@@ -188,6 +193,19 @@ def get_existing_events(headers, cutoff_date_utc_str):
             current = graph_events.get(pco_uid)
             if not current or meta["lastModified"] > current.get("lastModified", ""):
                 graph_events[pco_uid] = meta
+
+    # Read-only audit across every event, linked or not: two events with the
+    # same subject and exact start/end are visible duplicates to a user even
+    # when they carry different PCO UIDs (or no extension at all).
+    exact_dupes = {key: copies for key, copies in exact_groups.items() if len(copies) > 1}
+    if exact_dupes:
+        extras = sum(len(copies) - 1 for copies in exact_dupes.values())
+        print(f"  -> Exact subject/time duplicates: {len(exact_dupes)} group(s), {extras} extra cop(ies)")
+        for (subject, start_str, end_str), copies in list(exact_dupes.items())[:10]:
+            linked = sum(1 for c in copies if c["pcoUid"])
+            print(f"     {len(copies)}x {subject!r} start={start_str} end={end_str} linked={linked}")
+    else:
+        print("  -> No exact subject/time duplicates.")
 
     # Every extra copy sharing a PCO UID is a duplicate left behind by the old
     # delete/recreate sync. Collect them so the caller can delete them in one
