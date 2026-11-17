@@ -166,7 +166,12 @@ def get_existing_events(headers, cutoff_date_utc_str):
         end_str = event.get("end", {}).get("dateTime", "")[:19]
 
         exact_groups.setdefault((subject, start_str, end_str), []).append(
-            {"id": event["id"], "pcoUid": pco_uid}
+            {
+                "id": event["id"],
+                "pcoUid": pco_uid,
+                "lastModified": event.get("lastModifiedDateTime", ""),
+                "type": event.get("type", ""),
+            }
         )
 
         fp = f"{subject}_{start_str}"
@@ -244,7 +249,7 @@ def get_existing_events(headers, cutoff_date_utc_str):
             f"  -> Found {len(duplicate_ids)} duplicate cop(ies) across "
             f"{duplicate_groups} PCO UID(s)."
         )
-    return graph_events, all_fingerprints, duplicate_ids
+    return graph_events, all_fingerprints, duplicate_ids, exact_groups
 
 def build_extension_object(pco_uid):
     return {
@@ -275,12 +280,14 @@ def sync_calendars():
     cutoff_date_local_str = cutoff_date_local.strftime("%Y-%m-%dT00:00:00")
     
     print(f"Mapping existing calendar states for {TARGET_MAILBOX} (Looking back 60 days in {GRAPH_TZ_STRING})...")
-    graph_events, all_fingerprints, duplicate_ids = get_existing_events(
+    graph_events, all_fingerprints, duplicate_ids, exact_groups = get_existing_events(
         headers, cutoff_date_utc_str
     )
     
     pco_current_uids = set()
     endpoint = f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/events"
+
+    deleted_ids = set()
 
     if duplicate_ids:
         # Safety cap so a large backlog cannot run past the workflow timeout.
@@ -296,6 +303,7 @@ def sync_calendars():
             )
             if res_delete.status_code == 204:
                 removed += 1
+                deleted_ids.add(dup_id)
             else:
                 print(
                     f"  -> Failed to delete duplicate {dup_id}: "
@@ -465,6 +473,72 @@ def sync_calendars():
                 res_delete = graph_request("DELETE", delete_url, headers=headers)
                 if res_delete.status_code != 204:
                     print(f"  -> Failed to delete: {res_delete.text}")
+                else:
+                    deleted_ids.add(event_meta["id"])
+
+        # Remove exact subject/time duplicates that carry a different (or no)
+        # PCO UID. Only delete when the same subject/time still exists as a
+        # CURRENT feed event, so manual events and canceled events are kept.
+        exact_delete_ids = []
+        exact_groups_cleaned = 0
+        for key, copies in exact_groups.items():
+            if len(copies) < 2:
+                continue
+            current = [c for c in copies if c["pcoUid"] in pco_current_uids]
+            if not current:
+                continue
+            keep_ids = set()
+            for uid in {c["pcoUid"] for c in current}:
+                keep = max(
+                    (c for c in current if c["pcoUid"] == uid),
+                    key=lambda c: c["lastModified"],
+                )
+                keep_ids.add(keep["id"])
+            group_has_delete = False
+            for copy in copies:
+                if copy["id"] in keep_ids or copy["id"] in deleted_ids:
+                    continue
+                if copy["type"] not in ("singleInstance", ""):
+                    # Never delete a recurring series/occurrence.
+                    continue
+                exact_delete_ids.append(copy["id"])
+                group_has_delete = True
+                if len(exact_delete_ids) <= 5:
+                    print(
+                        f"    Exact duplicate: {key[0]!r} start={key[1]} "
+                        f"id={copy['id'][:16]} linked={bool(copy['pcoUid'])}"
+                    )
+            if group_has_delete:
+                exact_groups_cleaned += 1
+
+        if exact_delete_ids:
+            max_dup_deletes = int(os.environ.get("MAX_DUP_DELETES_PER_RUN", "10000"))
+            to_delete = exact_delete_ids[:max_dup_deletes]
+            print(f"Removing {len(to_delete)} exact subject/time duplicate event(s)...")
+            removed = 0
+            for event_id in to_delete:
+                res_delete = graph_request(
+                    "DELETE", f"{endpoint}/{event_id}", headers=headers
+                )
+                if res_delete.status_code == 204:
+                    removed += 1
+                    deleted_ids.add(event_id)
+                else:
+                    print(
+                        f"  -> Failed to delete exact duplicate {event_id}: "
+                        f"{res_delete.status_code} {res_delete.text[:200]}"
+                    )
+            print(
+                f"  -> Removed {removed}/{len(to_delete)} exact duplicate(s) "
+                f"across {exact_groups_cleaned} group(s)."
+            )
+            if len(exact_delete_ids) > len(to_delete):
+                print(
+                    f"  -> Deferring {len(exact_delete_ids) - len(to_delete)} "
+                    f"exact duplicate(s) to the next run."
+                )
+        else:
+            print("  -> No exact subject/time duplicates to remove.")
     else:
         print("Skipping purge because one or more feeds failed to load.")
 
